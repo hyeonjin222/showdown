@@ -27,6 +27,36 @@ public class ShowDown : ModuleRules
 		StageRuntimeDirectory("Binaries/ThirdParty/Whisper");
 		StageRuntimeFile("Content/LocalModels/Whisper/ggml-base.bin");
 		StageRuntimeDirectory("Binaries/ThirdParty/eSpeakNG");
+
+		// 시연용 패키지에 넣는 선택 파일들입니다. 없으면(예: LLMKey.txt는 gitignore) 빌드를 막지 않고 건너뜁니다.
+		// LLMKey.txt: 무료 Gemini 키(보스 AI 대화). 이 키가 든 패키지는 외부에 공개하지 마세요.
+		StageOptionalRuntimeFile("LLMKey.txt");
+		StageOptionalRuntimeDirectory("tools/demo-preflight");
+	}
+
+	private void StageOptionalRuntimeFile(string RelativeFile)
+	{
+		string ProjectRoot = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", ".."));
+		string AbsoluteFile = Path.GetFullPath(Path.Combine(ProjectRoot, RelativeFile));
+		if (File.Exists(AbsoluteFile))
+		{
+			RuntimeDependencies.Add(AbsoluteFile, StagedFileType.NonUFS);
+		}
+	}
+
+	private void StageOptionalRuntimeDirectory(string RelativeDirectory)
+	{
+		string ProjectRoot = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", ".."));
+		string AbsoluteDirectory = Path.GetFullPath(Path.Combine(ProjectRoot, RelativeDirectory));
+		if (!Directory.Exists(AbsoluteDirectory))
+		{
+			return;
+		}
+
+		foreach (string RuntimeFile in Directory.EnumerateFiles(AbsoluteDirectory, "*", SearchOption.AllDirectories))
+		{
+			RuntimeDependencies.Add(RuntimeFile, StagedFileType.NonUFS);
+		}
 	}
 
 	private void StageRuntimeDirectory(string RelativeDirectory)

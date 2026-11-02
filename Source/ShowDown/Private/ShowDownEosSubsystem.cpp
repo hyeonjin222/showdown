@@ -458,7 +458,9 @@ void UShowDownEosSubsystem::LoginWithSupabaseSession()
 
 	if (!SupabaseSubsystem || SupabaseSubsystem->GetAccessToken().IsEmpty())
 	{
-		OnEosLoginResult.Broadcast(false, TEXT("Supabase login is required before EOS login."));
+		OnEosLoginResult.Broadcast(false, SupabaseSubsystem && SupabaseSubsystem->IsOfflineGuest()
+			? TEXT("오프라인 모드에서는 멀티플레이를 사용할 수 없습니다. 싱글플레이를 이용해 주세요.")
+			: TEXT("Supabase login is required before EOS login."));
 		return;
 	}
 

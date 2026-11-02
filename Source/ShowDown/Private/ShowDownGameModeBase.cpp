@@ -31,6 +31,7 @@
 #include "SDPlayerSeat.h"
 #include "SDPlayerState.h"
 #include "ShowDownCharacter.h"
+#include "ShowDownCharacterSkinCatalog.h"
 #include "ShowDownEosSubsystem.h"
 #include "ShowDownGameStateBase.h"
 #include "ShowDownHubFlowManager.h"
@@ -3686,21 +3687,21 @@ void AShowDownGameModeBase::ConfigureSinglePlayerCharacters()
 		Character->SetCharacterSceneActive(bActive);
 	}
 
-	if (PlayerCharacter)
+	FString PlayerSkinId = AShowDownCharacter::GetDefaultCharacterSkinId();
+	if (UGameInstance* GameInstance = GetGameInstance())
 	{
-		FString PlayerSkinId = AShowDownCharacter::GetDefaultCharacterSkinId();
-		if (UGameInstance* GameInstance = GetGameInstance())
+		if (const USupabaseSubsystem* SupabaseSubsystem = GameInstance->GetSubsystem<USupabaseSubsystem>())
 		{
-			if (const USupabaseSubsystem* SupabaseSubsystem = GameInstance->GetSubsystem<USupabaseSubsystem>())
+			const FString EquippedSkinId = SupabaseSubsystem->GetEquippedSkinId(TEXT("character"));
+			if (!EquippedSkinId.TrimStartAndEnd().IsEmpty())
 			{
-				const FString EquippedSkinId = SupabaseSubsystem->GetEquippedSkinId(TEXT("character"));
-				if (!EquippedSkinId.TrimStartAndEnd().IsEmpty())
-				{
-					PlayerSkinId = EquippedSkinId;
-				}
+				PlayerSkinId = EquippedSkinId;
 			}
 		}
+	}
 
+	if (PlayerCharacter)
+	{
 		PlayerCharacter->SetCharacterIdentity(
 			EShowDownCharacterRole::Player,
 			EShowDownPlayerSlot::Player1,
@@ -3720,6 +3721,7 @@ void AShowDownGameModeBase::ConfigureSinglePlayerCharacters()
 			EShowDownCharacterRole::Opponent,
 			EShowDownPlayerSlot::None,
 			OpponentDisplayName);
+		OpponentCharacter->SetCharacterSkinId(PickRandomOpponentSkinId(PlayerSkinId));
 		OpponentCharacter->SetCharacterLives(CollectorState.Lives);
 		OpponentCharacter->SetCharacterSceneActive(true);
 	}
@@ -3731,6 +3733,49 @@ void AShowDownGameModeBase::ConfigureSinglePlayerCharacters()
 		PlayerCharacter ? *PlayerCharacter->GetName() : TEXT("None"),
 		OpponentCharacter ? *OpponentCharacter->GetName() : TEXT("None"),
 		FMath::Max(0, Characters.Num() - (PlayerCharacter ? 1 : 0) - (OpponentCharacter ? 1 : 0)));
+}
+
+FString AShowDownGameModeBase::PickRandomOpponentSkinId(const FString& PlayerSkinId)
+{
+	// 싱글플레이에 들어갈 때마다 상대 캐릭터를 카탈로그 전체에서 무작위로 고릅니다.
+	// 플레이어와 같은 캐릭터, 직전 판과 같은 캐릭터는 다른 선택지가 있으면 피합니다.
+	static FString LastOpponentSkinId;
+
+	TArray<FShowDownCharacterSkinDefinition> Definitions;
+	UShowDownCharacterSkinCatalog::GetOrderedSkinDefinitions(
+		UShowDownCharacterSkinCatalog::LoadDefaultCatalog(),
+		Definitions);
+
+	const FString CanonicalPlayerSkin = UShowDownCharacterSkinCatalog::CanonicalizeSkinId(PlayerSkinId);
+	TArray<FString> Candidates;
+	TArray<FString> AllSkins;
+	for (const FShowDownCharacterSkinDefinition& Definition : Definitions)
+	{
+		const FString SkinId = UShowDownCharacterSkinCatalog::CanonicalizeSkinId(Definition.SkinId);
+		if (SkinId.IsEmpty() || AllSkins.Contains(SkinId))
+		{
+			continue;
+		}
+		AllSkins.Add(SkinId);
+		if (!SkinId.Equals(CanonicalPlayerSkin, ESearchCase::IgnoreCase)
+			&& !SkinId.Equals(LastOpponentSkinId, ESearchCase::IgnoreCase))
+		{
+			Candidates.Add(SkinId);
+		}
+	}
+
+	if (Candidates.Num() == 0)
+	{
+		Candidates = AllSkins;
+	}
+	if (Candidates.Num() == 0)
+	{
+		return AShowDownCharacter::GetDefaultCharacterSkinId();
+	}
+
+	LastOpponentSkinId = Candidates[FMath::RandRange(0, Candidates.Num() - 1)];
+	UE_LOG(LogTemp, Log, TEXT("Single-player opponent skin: %s (from %d candidates)"), *LastOpponentSkinId, Candidates.Num());
+	return LastOpponentSkinId;
 }
 
 void AShowDownGameModeBase::ConfigureMultiplayerCharacters(const TArray<ASDPlayerState*>& Players)
@@ -4523,7 +4568,8 @@ void AShowDownGameModeBase::TryRequestBossChatReply(const FString& PlayerDialogu
 	{
 		if (USDLLMSubsystem* LLMSubsystem = GameInstance->GetSubsystem<USDLLMSubsystem>())
 		{
-			if (!LLMSubsystem->bEnableInstantBossChatReply || !LLMSubsystem->CanMakeRequests())
+			// LLM 키가 없어도 대본 대사로 대답할 수 있으면 진행합니다.
+			if (!LLMSubsystem->bEnableInstantBossChatReply || !LLMSubsystem->CanReplyToChat())
 			{
 				return;
 			}
@@ -4704,7 +4750,7 @@ void AShowDownGameModeBase::ResolveCollectorBetResponse()
 	{
 		if (USDLLMSubsystem* LLMSubsystem = GameInstance->GetSubsystem<USDLLMSubsystem>())
 		{
-			if (LLMSubsystem->CanMakeRequests())
+			if (LLMSubsystem->bUseLLMForBetDecisions && LLMSubsystem->CanMakeRequests())
 			{
 				if (AShowDownGameStateBase* ShowDownGameState = GetShowDownGameState())
 				{

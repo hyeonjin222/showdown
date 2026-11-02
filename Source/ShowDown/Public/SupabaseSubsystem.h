@@ -1,9 +1,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "HttpFwd.h"
 #include "SupabaseSubsystem.generated.h"
+
+class FJsonObject;
 
 // 로그인 요청이 끝났을 때 UI나 다른 코드에 결과를 알려주는 이벤트입니다.
 // bSuccess는 성공 여부, Message는 화면에 표시할 간단한 상태 문구입니다.
@@ -284,6 +287,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Supabase")
 	void AwardWinReward(const FString& MatchId);
 
+	virtual void Deinitialize() override;
+
+	// 마지막 로그인이 서버 응답을 받지 못한(네트워크) 실패였는지 알려줍니다.
+	// LoginWidget이 이 값을 보고 "오프라인으로 시작" 버튼을 띄웁니다.
+	UFUNCTION(BlueprintPure, Category = "Supabase")
+	bool DidLastLoginFailFromNetwork() const { return bLastLoginFailedFromNetwork; }
+
+	// 시연장 네트워크가 로그인 서버를 막을 때를 위한 오프라인 게스트 세션입니다.
+	// 토큰이 없으므로 보상/상점/랭킹/멀티플레이는 동작하지 않고, 싱글플레이만 가능합니다.
+	UFUNCTION(BlueprintCallable, Category = "Supabase")
+	void StartOfflineGuestSession();
+
+	UFUNCTION(BlueprintPure, Category = "Supabase")
+	bool IsOfflineGuest() const { return bOfflineGuest; }
+
+	// 개발용 showdown.LoginTest 콘솔 명령이 로그인 결과를 로그로 남길 때 사용합니다.
+	UFUNCTION()
+	void LogLoginResultForTest(bool bSuccess, const FString& Message);
+
 private:
 	bool bAwardWinRewardInFlight = false;
 	bool bCosmeticDataLoadInFlight = false;
@@ -291,6 +313,8 @@ private:
 	bool bHasCosmeticDataSnapshot = false;
 	bool bSkinPurchaseInFlight = false;
 	bool bSkinEquipInFlight = false;
+	bool bLastLoginFailedFromNetwork = false;
+	bool bOfflineGuest = false;
 	uint64 LoginAttemptGeneration = 0;
 	uint64 AuthSessionGeneration = 0;
 	uint64 PlayerDataRequestGeneration = 0;
@@ -311,6 +335,12 @@ private:
 
 	// 로그인 성공 시 응답에서 가져오는 유저 고유 id입니다.
 	FString UserId;
+
+	// access_token은 기본 1시간 뒤 만료됩니다. 시연처럼 게임을 오래 켜 두면
+	// 이후 EOS 로그인/보상/상점 요청이 모두 401로 실패하므로, 만료 전에 이 토큰으로 갱신합니다.
+	FString RefreshToken;
+	FTSTicker::FDelegateHandle TokenRefreshTickerHandle;
+	bool bTokenRefreshInFlight = false;
 
 	// profiles 테이블에서 불러온 닉네임입니다.
 	FString Nickname;
@@ -351,9 +381,17 @@ private:
 	// access_token과 user.id를 파싱하고, 성공하면 LoadPlayerData를 호출합니다.
 	void HandleLoginResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, uint64 LoginGeneration);
 
+	// 로그인 서버에 끝내 접속하지 못했을 때, 원인을 현장에서 바로 알 수 있도록
+	// 인터넷 연결 / 와이파이 웹 인증 / PC 시간 / 서버 차단 순서로 검사해서 해결 방법을 알려줍니다.
+	void DiagnoseLoginNetworkFailure(uint64 LoginGeneration, const FString& FailureReason);
+
+	// login-with-id 요청을 실제로 보냅니다. Attempt는 네트워크 재시도 횟수(0부터)입니다.
+	void SendLoginWithIdRequest(const FString& Id, const FString& Password, uint64 LoginGeneration, int32 Attempt);
+
 	// login-with-id Edge Function 응답을 처리합니다.
 	// access_token과 user_id를 파싱하고, 성공하면 LoadPlayerData를 호출합니다.
-	void HandleLoginWithIdResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, uint64 LoginGeneration);
+	// 서버에 닿지 못한 실패(연결 오류/타임아웃)는 짧게 기다렸다가 자동으로 다시 시도합니다.
+	void HandleLoginWithIdResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, uint64 LoginGeneration, FString Id, FString Password, int32 Attempt);
 
 	// profiles 테이블 응답을 처리해서 Nickname 값을 저장합니다.
 	void HandleProfileResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, uint64 RequestGeneration, uint64 PlayerDataGeneration);
@@ -387,6 +425,16 @@ private:
 	// rebuilding the shop from a partially refreshed cache.
 	void CompleteCosmeticDataRequest(bool bSuccess, const FString& Message);
 	void BeginAuthenticatedSession();
+
+	// 로그인/갱신 응답의 refresh_token과 expires_in을 저장하고 다음 갱신을 예약합니다.
+	// 오프라인 게스트용 상점 목록을 게임에 포함된 캐릭터 카탈로그로 채웁니다.
+	void BuildOfflineShopCatalog();
+
+	void StoreSessionTokens(const TSharedPtr<FJsonObject>& SessionObject);
+	void ScheduleTokenRefresh(float DelaySeconds);
+	void CancelTokenRefresh();
+	void RefreshAccessToken();
+	void HandleRefreshTokenResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, uint64 RequestGeneration);
 
 	// AccessToken이 필요한 Supabase REST 요청을 공통으로 만들어주는 helper 함수입니다.
 	// apikey, Authorization, Content-Type 헤더를 매번 반복해서 쓰지 않기 위해 분리했습니다.

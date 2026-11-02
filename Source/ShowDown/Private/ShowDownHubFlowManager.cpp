@@ -113,7 +113,8 @@ void AShowDownHubFlowManager::BeginPlay()
 	{
 		if (const USupabaseSubsystem* SupabaseSubsystem = GameInstance->GetSubsystem<USupabaseSubsystem>())
 		{
-			bHasSession = !SupabaseSubsystem->GetAccessToken().IsEmpty();
+			// 오프라인 게스트도 허브로 돌아왔을 때 로그인 화면이 아니라 메인 메뉴로 복귀시킵니다.
+			bHasSession = !SupabaseSubsystem->GetAccessToken().IsEmpty() || SupabaseSubsystem->IsOfflineGuest();
 		}
 
 		if (const UShowDownEosSubsystem* EosSubsystem = GameInstance->GetSubsystem<UShowDownEosSubsystem>())

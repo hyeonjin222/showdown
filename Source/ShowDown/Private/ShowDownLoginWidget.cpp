@@ -7,6 +7,7 @@
 #include "Components/Border.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/PanelWidget.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/VerticalBox.h"
@@ -68,6 +69,89 @@ void UShowDownLoginWidget::NativeConstruct()
 	}
 
 	HideStatusMessage();
+	// 시연 중 네트워크가 막혀도 바로 진행할 수 있게 오프라인 시작 버튼은 항상 보여줍니다.
+	EnsureOfflineButton();
+	SetOfflineButtonVisible(true);
+}
+
+void UShowDownLoginWidget::EnsureOfflineButton()
+{
+	if (Button_Offline || !WidgetTree || !Text_Status)
+	{
+		return;
+	}
+
+	UPanelWidget* StatusParent = Text_Status->GetParent();
+	if (!StatusParent)
+	{
+		return;
+	}
+
+	Button_Offline = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), TEXT("Button_Offline"));
+	Button_Offline->SetBackgroundColor(FLinearColor(0.55f, 0.38f, 0.08f, 1.0f));
+
+	UTextBlock* OfflineLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Text_OfflineLabel"));
+	OfflineLabel->SetText(FText::FromString(TEXT("오프라인으로 시작 (싱글플레이)")));
+	OfflineLabel->SetColorAndOpacity(FSlateColor(FLinearColor::White));
+	OfflineLabel->SetJustification(ETextJustify::Center);
+	FSlateFontInfo OfflineFont = OfflineLabel->GetFont();
+	OfflineFont.Size = 15;
+	OfflineLabel->SetFont(OfflineFont);
+	Button_Offline->AddChild(OfflineLabel);
+
+	// WBP_Login은 캔버스 배치라서 LOGIN 버튼과 같은 기준점에 두고 바로 오른쪽으로 옮깁니다.
+	UCanvasPanelSlot* LoginCanvasSlot = Button_Login ? Cast<UCanvasPanelSlot>(Button_Login->Slot) : nullptr;
+	UCanvasPanel* LoginCanvas = LoginCanvasSlot ? Cast<UCanvasPanel>(Button_Login->GetParent()) : nullptr;
+	if (LoginCanvas)
+	{
+		UCanvasPanelSlot* OfflineCanvasSlot = LoginCanvas->AddChildToCanvas(Button_Offline);
+		OfflineCanvasSlot->SetAnchors(LoginCanvasSlot->GetAnchors());
+		OfflineCanvasSlot->SetAlignment(LoginCanvasSlot->GetAlignment());
+		const FVector2D LoginSize = LoginCanvasSlot->GetSize();
+		OfflineCanvasSlot->SetPosition(LoginCanvasSlot->GetPosition() + FVector2D(LoginSize.X + 12.0f, 0.0f));
+		OfflineCanvasSlot->SetSize(FVector2D(FMath::Max(LoginSize.X, 260.0f), LoginSize.Y));
+		OfflineCanvasSlot->SetZOrder(LoginCanvasSlot->GetZOrder() + 1);
+	}
+	else
+	{
+		UPanelSlot* OfflineSlot = StatusParent->AddChild(Button_Offline);
+		if (UVerticalBoxSlot* VerticalSlot = Cast<UVerticalBoxSlot>(OfflineSlot))
+		{
+			VerticalSlot->SetPadding(FMargin(0.0f, 10.0f, 0.0f, 0.0f));
+			VerticalSlot->SetHorizontalAlignment(HAlign_Fill);
+		}
+	}
+
+	Button_Offline->OnClicked.AddUniqueDynamic(this, &UShowDownLoginWidget::HandleOfflineClicked);
+}
+
+void UShowDownLoginWidget::SetOfflineButtonVisible(const bool bVisible)
+{
+	if (Button_Offline)
+	{
+		Button_Offline->SetVisibility(bVisible ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+	}
+}
+
+void UShowDownLoginWidget::HandleOfflineClicked()
+{
+	USupabaseSubsystem* SupabaseSubsystem = GetGameInstance()
+		? GetGameInstance()->GetSubsystem<USupabaseSubsystem>()
+		: nullptr;
+	if (!SupabaseSubsystem)
+	{
+		return;
+	}
+
+	SupabaseSubsystem->StartOfflineGuestSession();
+
+	if (Button_Login)
+	{
+		Button_Login->SetIsEnabled(true);
+	}
+
+	// 정상 로그인 성공과 같은 경로로 메인 메뉴에 들어갑니다.
+	HandleLoginResult(true, TEXT("Offline guest session."));
 }
 
 void UShowDownLoginWidget::BuildFigmaLayout()
@@ -166,6 +250,8 @@ void UShowDownLoginWidget::BuildFigmaLayout()
 	Text_Status = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Text_Status"));
 	Text_Status->SetColorAndOpacity(FSlateColor(MutedInk));
 	Text_Status->SetJustification(ETextJustify::Center);
+	// 네트워크 진단 안내처럼 긴 문구가 패널 밖으로 잘리지 않게 줄바꿈합니다.
+	Text_Status->SetAutoWrapText(true);
 	UVerticalBoxSlot* StatusSlot = Stack->AddChildToVerticalBox(Text_Status);
 	StatusSlot->SetPadding(FMargin(0.0f, 14.0f, 0.0f, 0.0f));
 	StatusSlot->SetHorizontalAlignment(HAlign_Fill);
@@ -277,6 +363,13 @@ void UShowDownLoginWidget::HandleLoginResult(bool bSuccess, const FString& Messa
 	if (bIsProgressMessage)
 	{
 		HideStatusMessage();
+		return;
+	}
+
+	// 네트워크 재시도 중에는 안내만 보여주고 버튼은 잠근 채로 둡니다.
+	if (Message.StartsWith(TEXT("Connection unstable.")))
+	{
+		ShowStatusError(Message);
 		return;
 	}
 

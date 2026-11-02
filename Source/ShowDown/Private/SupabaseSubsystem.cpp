@@ -1,5 +1,9 @@
 #include "SupabaseSubsystem.h"
 
+#include "Containers/Ticker.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Json.h"
@@ -8,6 +12,43 @@
 
 namespace
 {
+// 서버 응답을 받기 전에 끊긴 로그인 요청을 몇 번 더 시도할지 정합니다.
+// 행사장 와이파이처럼 순간적으로 끊기는 네트워크에서 한 번의 실패로 로그인이 막히지 않게 합니다.
+constexpr int32 MaxLoginNetworkRetries = 2;
+constexpr float LoginRetryBaseDelaySeconds = 1.5f;
+
+// Windows가 인터넷 연결 확인에 쓰는 주소입니다. 일부러 HTTP(보안 연결 아님)를 써서
+// PC 시간이 틀려 보안 연결이 깨진 상황에서도 응답과 서버 시각(Date 헤더)을 받을 수 있게 합니다.
+// 와이파이 웹 인증이 필요한 망에서는 이 요청이 로그인 페이지로 가로채져 본문이 달라집니다.
+#if !UE_BUILD_SHIPPING
+// 개발 빌드 전용: UI 없이 로그인 실패/진단 경로를 재현하기 위한 콘솔 명령입니다.
+// 예) showdown.LoginTest probe_user x  → 정상 망이면 "ID or password is incorrect."
+FAutoConsoleCommandWithWorldAndArgs GShowDownLoginTestCommand(
+	TEXT("showdown.LoginTest"),
+	TEXT("showdown.LoginTest <id> <password> : runs the ID login flow and logs the result."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+		USupabaseSubsystem* Supabase = GameInstance ? GameInstance->GetSubsystem<USupabaseSubsystem>() : nullptr;
+		if (!Supabase || Args.Num() < 2)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("showdown.LoginTest: usage showdown.LoginTest <id> <password>"));
+			return;
+		}
+
+		Supabase->OnLoginResult.AddUniqueDynamic(Supabase, &USupabaseSubsystem::LogLoginResultForTest);
+		Supabase->LoginWithId(Args[0], Args[1]);
+	}));
+#endif
+
+const TCHAR* ConnectivityProbeUrl = TEXT("http://www.msftconnecttest.com/connecttest.txt");
+const TCHAR* ConnectivityProbeExpectedBody = TEXT("Microsoft Connect Test");
+constexpr float ConnectivityProbeTimeoutSeconds = 6.0f;
+constexpr double MaxAllowedClockSkewSeconds = 300.0;
+
+// 오프라인 시연 모드의 코인입니다. 구매해도 줄어들지 않아 사실상 무제한입니다.
+constexpr int32 OfflineGuestCoin = 999999;
+
 FString MakeLoginFailureMessage(int32 StatusCode)
 {
 	if (StatusCode == 400 || StatusCode == 401)
@@ -62,6 +103,7 @@ FString MakeRewardFailureMessage(int32 StatusCode)
 void USupabaseSubsystem::LoginWithEmail(const FString& Email, const FString& Password)
 {
 	const uint64 LoginGeneration = ++LoginAttemptGeneration;
+	bLastLoginFailedFromNetwork = false;
 
 	// 이메일이나 비밀번호가 비어 있으면 서버에 요청하지 않고 바로 실패 처리합니다.
 	if (Email.IsEmpty() || Password.IsEmpty())
@@ -131,7 +173,9 @@ void USupabaseSubsystem::HandleLoginResponse(
 	// 네트워크 요청 자체가 실패했거나 응답 객체가 없으면 실패 처리합니다.
 	if (!bWasSuccessful || !Response.IsValid())
 	{
-		OnLoginResult.Broadcast(false, TEXT("Network error. Check your connection and try again."));
+		const FString FailureReason = Request.IsValid() ? LexToString(Request->GetFailureReason()) : TEXT("NoRequest");
+		UE_LOG(LogTemp, Warning, TEXT("Supabase login network failure: %s"), *FailureReason);
+		DiagnoseLoginNetworkFailure(LoginGeneration, FailureReason);
 		return;
 	}
 
@@ -183,6 +227,7 @@ void USupabaseSubsystem::HandleLoginResponse(
 	AccessToken = MoveTemp(NewAccessToken);
 	UserId = MoveTemp(NewUserId);
 	BeginAuthenticatedSession();
+	StoreSessionTokens(JsonObject);
 
 	UE_LOG(LogTemp, Log, TEXT("Supabase login success"));
 	UE_LOG(LogTemp, Log, TEXT("UserId: %s"), *UserId);
@@ -194,9 +239,76 @@ void USupabaseSubsystem::HandleLoginResponse(
 	OnLoginResult.Broadcast(true, TEXT("Login success."));
 }
 
+void USupabaseSubsystem::DiagnoseLoginNetworkFailure(const uint64 LoginGeneration, const FString& FailureReason)
+{
+	// "Connection unstable." 으로 시작하는 문구는 LoginWidget이 진행 중 안내로 취급해 버튼을 잠근 채로 둡니다.
+	OnLoginResult.Broadcast(false, TEXT("Connection unstable. Checking network..."));
+
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Probe = FHttpModule::Get().CreateRequest();
+	Probe->SetURL(ConnectivityProbeUrl);
+	Probe->SetVerb(TEXT("GET"));
+	Probe->SetTimeout(ConnectivityProbeTimeoutSeconds);
+
+	Probe->OnProcessRequestComplete().BindWeakLambda(this,
+		[this, LoginGeneration, FailureReason](FHttpRequestPtr, FHttpResponsePtr Response, bool bWasSuccessful)
+		{
+			if (LoginGeneration != LoginAttemptGeneration)
+			{
+				return;
+			}
+
+			FString Diagnosis;
+			FString Message;
+
+			if (!bWasSuccessful || !Response.IsValid())
+			{
+				Diagnosis = TEXT("NoInternet");
+				Message = TEXT("인터넷에 연결되어 있지 않습니다.\n랜선/와이파이를 확인하거나 휴대폰 핫스팟(USB 테더링)으로 연결하세요.");
+			}
+			else if (!Response->GetContentAsString().Contains(ConnectivityProbeExpectedBody))
+			{
+				Diagnosis = TEXT("CaptivePortal");
+				Message = TEXT("와이파이 웹 인증이 필요한 네트워크입니다.\n브라우저를 열어 인증(로그인)한 뒤 다시 시도하거나 휴대폰 핫스팟을 사용하세요.");
+			}
+			else
+			{
+				FDateTime ServerUtc;
+				const bool bHasServerTime = FDateTime::ParseHttpDate(Response->GetHeader(TEXT("Date")), ServerUtc);
+				const double SkewSeconds = bHasServerTime
+					? (FDateTime::UtcNow() - ServerUtc).GetTotalSeconds()
+					: 0.0;
+
+				if (FMath::Abs(SkewSeconds) > MaxAllowedClockSkewSeconds)
+				{
+					Diagnosis = FString::Printf(TEXT("ClockSkew(%.0fs)"), SkewSeconds);
+					Message = FString::Printf(
+						TEXT("PC 시간이 실제와 약 %d분 다릅니다.\nWindows 설정 > 시간 및 언어 > 날짜 및 시간 > '지금 동기화'를 누른 뒤 다시 시도하세요."),
+						FMath::RoundToInt(FMath::Abs(SkewSeconds) / 60.0));
+				}
+				else
+				{
+					Diagnosis = TEXT("ServerBlocked");
+					Message = TEXT("인터넷은 되지만 로그인 서버(supabase.co)에 접속할 수 없습니다. 이 네트워크나 방화벽/백신이 게임을 막고 있습니다.\n휴대폰 핫스팟으로 바꾸거나, 방화벽에서 게임을 허용하거나, 오른쪽 버튼으로 오프라인 시연을 시작하세요.");
+				}
+			}
+
+			UE_LOG(LogTemp, Warning, TEXT("Login network diagnosis: %s (login failure: %s)"), *Diagnosis, *FailureReason);
+			bLastLoginFailedFromNetwork = true;
+			OnLoginResult.Broadcast(false, FString::Printf(TEXT("%s [%s]"), *Message, *FailureReason));
+		});
+
+	if (!Probe->ProcessRequest())
+	{
+		bLastLoginFailedFromNetwork = true;
+		OnLoginResult.Broadcast(false, FString::Printf(
+			TEXT("로그인 서버에 접속할 수 없습니다. 네트워크를 확인하거나 휴대폰 핫스팟을 사용하세요. [%s]"), *FailureReason));
+	}
+}
+
 void USupabaseSubsystem::LoginWithId(const FString& Id, const FString& Password)
 {
 	const uint64 LoginGeneration = ++LoginAttemptGeneration;
+	bLastLoginFailedFromNetwork = false;
 
 	// 아이디나 비밀번호가 비어 있으면 서버에 요청하지 않고 바로 실패 처리합니다.
 	if (Id.IsEmpty() || Password.IsEmpty())
@@ -205,6 +317,16 @@ void USupabaseSubsystem::LoginWithId(const FString& Id, const FString& Password)
 		return;
 	}
 
+	SendLoginWithIdRequest(Id, Password, LoginGeneration, 0);
+}
+
+void USupabaseSubsystem::SendLoginWithIdRequest(
+	const FString& Id,
+	const FString& Password,
+	const uint64 LoginGeneration,
+	const int32 Attempt
+)
+{
 	// login-with-id Edge Function을 호출합니다.
 	// 아이디->이메일 매핑과 실제 로그인은 서버에서 처리되고, 응답으로 세션만 옵니다.
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
@@ -230,7 +352,10 @@ void USupabaseSubsystem::LoginWithId(const FString& Id, const FString& Password)
 	Request->OnProcessRequestComplete().BindUObject(
 		this,
 		&USupabaseSubsystem::HandleLoginWithIdResponse,
-		LoginGeneration
+		LoginGeneration,
+		Id,
+		Password,
+		Attempt
 	);
 
 	if (!Request->ProcessRequest())
@@ -242,14 +367,20 @@ void USupabaseSubsystem::LoginWithId(const FString& Id, const FString& Password)
 		return;
 	}
 
-	OnLoginResult.Broadcast(false, TEXT("Logging in..."));
+	if (Attempt == 0)
+	{
+		OnLoginResult.Broadcast(false, TEXT("Logging in..."));
+	}
 }
 
 void USupabaseSubsystem::HandleLoginWithIdResponse(
 	FHttpRequestPtr Request,
 	FHttpResponsePtr Response,
 	bool bWasSuccessful,
-	const uint64 LoginGeneration
+	const uint64 LoginGeneration,
+	FString Id,
+	FString Password,
+	const int32 Attempt
 )
 {
 	if (LoginGeneration != LoginAttemptGeneration)
@@ -259,7 +390,35 @@ void USupabaseSubsystem::HandleLoginWithIdResponse(
 
 	if (!bWasSuccessful || !Response.IsValid())
 	{
-		OnLoginResult.Broadcast(false, TEXT("Network error. Check your connection and try again."));
+		const EHttpFailureReason Reason = Request.IsValid()
+			? Request->GetFailureReason()
+			: EHttpFailureReason::Other;
+		UE_LOG(LogTemp, Warning, TEXT("Login (id) network failure: %s (attempt %d/%d)"),
+			LexToString(Reason), Attempt + 1, MaxLoginNetworkRetries + 1);
+
+		// 서버에 닿지 못한 실패만 재시도합니다. 401 같은 서버 응답은 재시도하지 않습니다.
+		if (Attempt < MaxLoginNetworkRetries && Reason != EHttpFailureReason::Cancelled)
+		{
+			OnLoginResult.Broadcast(false, FString::Printf(
+				TEXT("Connection unstable. Retrying login (%d/%d)..."), Attempt + 1, MaxLoginNetworkRetries));
+
+			const float RetryDelay = LoginRetryBaseDelaySeconds * (Attempt + 1);
+			TWeakObjectPtr<USupabaseSubsystem> WeakThis(this);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[WeakThis, Id = MoveTemp(Id), Password = MoveTemp(Password), LoginGeneration, Attempt](float)
+				{
+					// 기다리는 동안 사용자가 다시 로그인을 눌렀다면 이전 재시도는 버립니다.
+					if (USupabaseSubsystem* Self = WeakThis.Get();
+						Self && LoginGeneration == Self->LoginAttemptGeneration)
+					{
+						Self->SendLoginWithIdRequest(Id, Password, LoginGeneration, Attempt + 1);
+					}
+					return false;
+				}), RetryDelay);
+			return;
+		}
+
+		DiagnoseLoginNetworkFailure(LoginGeneration, LexToString(Reason));
 		return;
 	}
 
@@ -302,6 +461,7 @@ void USupabaseSubsystem::HandleLoginWithIdResponse(
 	AccessToken = MoveTemp(NewAccessToken);
 	UserId = MoveTemp(NewUserId);
 	BeginAuthenticatedSession();
+	StoreSessionTokens(JsonObject);
 
 	UE_LOG(LogTemp, Log, TEXT("Login (id) success. UserId: %s"), *UserId);
 
@@ -318,6 +478,11 @@ void USupabaseSubsystem::BeginAuthenticatedSession()
 	// stale generation before touching the new account's state.
 	++AuthSessionGeneration;
 	++PlayerDataRequestGeneration;
+
+	bOfflineGuest = false;
+	CancelTokenRefresh();
+	RefreshToken.Empty();
+	bTokenRefreshInFlight = false;
 
 	Nickname.Empty();
 	Coin = 0;
@@ -346,8 +511,234 @@ void USupabaseSubsystem::BeginAuthenticatedSession()
 	PendingSkinSetItemsBySetId.Empty();
 }
 
+void USupabaseSubsystem::StartOfflineGuestSession()
+{
+	// 진행 중인 로그인 재시도/진단 응답이 게스트 세션을 덮어쓰지 않도록 세대를 넘깁니다.
+	++LoginAttemptGeneration;
+	BeginAuthenticatedSession();
+
+	AccessToken.Empty();
+	UserId.Empty();
+	Nickname = TEXT("GCC모범생");
+	Coin = OfflineGuestCoin;
+	bOfflineGuest = true;
+	bLastLoginFailedFromNetwork = false;
+	BuildOfflineShopCatalog();
+
+	UE_LOG(LogTemp, Warning, TEXT("Started offline guest session (no Supabase/EOS features)."));
+	OnPlayerDataLoaded.Broadcast(true, TEXT("Offline guest session."));
+}
+
+void USupabaseSubsystem::BuildOfflineShopCatalog()
+{
+	ShopSkins.Reset();
+	SkinSetItemsBySetId.Reset();
+
+	TArray<FShowDownCharacterSkinDefinition> Definitions;
+	UShowDownCharacterSkinCatalog::GetOrderedSkinDefinitions(
+		UShowDownCharacterSkinCatalog::LoadDefaultCatalog(),
+		Definitions);
+
+	for (const FShowDownCharacterSkinDefinition& Definition : Definitions)
+	{
+		if (Definition.SkinId.IsEmpty())
+		{
+			continue;
+		}
+
+		// 서버 상품(skin_sets)과 같은 모양으로 만들어서 상점 UI를 그대로 재사용합니다.
+		FShowDownSkin Product;
+		Product.Id = Definition.SkinId;
+		Product.Name = Definition.DisplayName.IsEmpty() ? Definition.SkinId : Definition.DisplayName.ToString();
+		Product.Type = TEXT("character");
+		Product.bIsActive = true;
+		switch (Definition.Rarity)
+		{
+		case EShowDownCharacterSkinRarity::Rare: Product.Rarity = TEXT("rare"); Product.Price = 1000; break;
+		case EShowDownCharacterSkinRarity::Epic: Product.Rarity = TEXT("epic"); Product.Price = 2000; break;
+		case EShowDownCharacterSkinRarity::Legendary: Product.Rarity = TEXT("legendary"); Product.Price = 5000; break;
+		default: Product.Rarity = TEXT("common"); Product.Price = 500; break;
+		}
+		ShopSkins.Add(Product);
+
+		FShowDownSkin CharacterItem;
+		CharacterItem.Id = Definition.SkinId;
+		CharacterItem.Type = TEXT("character");
+		SkinSetItemsBySetId.FindOrAdd(Product.Id).Add(CharacterItem);
+	}
+
+	bHasCosmeticDataSnapshot = true;
+	UE_LOG(LogTemp, Log, TEXT("Offline shop catalog built: %d items."), ShopSkins.Num());
+}
+
+void USupabaseSubsystem::LogLoginResultForTest(bool bSuccess, const FString& Message)
+{
+	UE_LOG(LogTemp, Display, TEXT("[LoginTest] success=%d message=%s"), bSuccess ? 1 : 0, *Message);
+}
+
+void USupabaseSubsystem::Deinitialize()
+{
+	CancelTokenRefresh();
+	Super::Deinitialize();
+}
+
+void USupabaseSubsystem::StoreSessionTokens(const TSharedPtr<FJsonObject>& SessionObject)
+{
+	if (!SessionObject.IsValid())
+	{
+		return;
+	}
+
+	FString NewRefreshToken;
+	if (SessionObject->TryGetStringField(TEXT("refresh_token"), NewRefreshToken) && !NewRefreshToken.IsEmpty())
+	{
+		RefreshToken = MoveTemp(NewRefreshToken);
+	}
+
+	double ExpiresInSeconds = 3600.0;
+	SessionObject->TryGetNumberField(TEXT("expires_in"), ExpiresInSeconds);
+
+	if (RefreshToken.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Supabase session has no refresh_token; it will expire in %.0fs."), ExpiresInSeconds);
+		return;
+	}
+
+	// 만료 5분 전(짧은 토큰이면 80% 시점)에 갱신해서 네트워크가 잠깐 끊겨도 재시도할 여유를 둡니다.
+	const double RefreshDelay = FMath::Max(30.0, FMath::Min(ExpiresInSeconds - 300.0, ExpiresInSeconds * 0.8));
+	ScheduleTokenRefresh(static_cast<float>(RefreshDelay));
+}
+
+void USupabaseSubsystem::ScheduleTokenRefresh(const float DelaySeconds)
+{
+	CancelTokenRefresh();
+
+	TWeakObjectPtr<USupabaseSubsystem> WeakThis(this);
+	TokenRefreshTickerHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[WeakThis](float)
+		{
+			if (USupabaseSubsystem* Self = WeakThis.Get())
+			{
+				Self->TokenRefreshTickerHandle.Reset();
+				Self->RefreshAccessToken();
+			}
+			return false;
+		}), DelaySeconds);
+}
+
+void USupabaseSubsystem::CancelTokenRefresh()
+{
+	if (TokenRefreshTickerHandle.IsValid())
+	{
+		FTSTicker::RemoveTicker(TokenRefreshTickerHandle);
+		TokenRefreshTickerHandle.Reset();
+	}
+}
+
+void USupabaseSubsystem::RefreshAccessToken()
+{
+	if (RefreshToken.IsEmpty() || bTokenRefreshInFlight)
+	{
+		return;
+	}
+
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(SupabaseUrl + TEXT("/auth/v1/token?grant_type=refresh_token"));
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("apikey"), SupabasePublishableKey);
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+
+	TSharedPtr<FJsonObject> BodyObject = MakeShared<FJsonObject>();
+	BodyObject->SetStringField(TEXT("refresh_token"), RefreshToken);
+
+	FString BodyString;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyString);
+	FJsonSerializer::Serialize(BodyObject.ToSharedRef(), Writer);
+	Request->SetContentAsString(BodyString);
+
+	Request->OnProcessRequestComplete().BindUObject(
+		this,
+		&USupabaseSubsystem::HandleRefreshTokenResponse,
+		AuthSessionGeneration
+	);
+
+	bTokenRefreshInFlight = true;
+	if (!Request->ProcessRequest())
+	{
+		bTokenRefreshInFlight = false;
+		ScheduleTokenRefresh(30.0f);
+	}
+}
+
+void USupabaseSubsystem::HandleRefreshTokenResponse(
+	FHttpRequestPtr Request,
+	FHttpResponsePtr Response,
+	bool bWasSuccessful,
+	const uint64 RequestGeneration
+)
+{
+	// 갱신 중에 다른 계정으로 다시 로그인했다면 이전 세션의 응답은 버립니다.
+	if (RequestGeneration != AuthSessionGeneration)
+	{
+		return;
+	}
+
+	bTokenRefreshInFlight = false;
+
+	// 네트워크가 잠깐 끊긴 경우: refresh_token은 아직 유효하므로 30초 뒤 다시 시도합니다.
+	if (!bWasSuccessful || !Response.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Supabase token refresh network failure: %s. Retrying in 30s."),
+			Request.IsValid() ? LexToString(Request->GetFailureReason()) : TEXT("NoRequest"));
+		ScheduleTokenRefresh(30.0f);
+		return;
+	}
+
+	const int32 StatusCode = Response->GetResponseCode();
+	const FString ResponseText = Response->GetContentAsString();
+
+	if (StatusCode >= 500 || StatusCode == 429)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Supabase token refresh failed: %d. Retrying in 60s."), StatusCode);
+		ScheduleTokenRefresh(60.0f);
+		return;
+	}
+
+	if (StatusCode < 200 || StatusCode >= 300)
+	{
+		// refresh_token 자체가 거부되면 다시 로그인하는 수밖에 없습니다.
+		UE_LOG(LogTemp, Warning, TEXT("Supabase token refresh rejected: %d / %s"), StatusCode, *ResponseText);
+		return;
+	}
+
+	TSharedPtr<FJsonObject> JsonObject;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResponseText);
+	FString NewAccessToken;
+	if (!FJsonSerializer::Deserialize(Reader, JsonObject)
+		|| !JsonObject.IsValid()
+		|| !JsonObject->TryGetStringField(TEXT("access_token"), NewAccessToken)
+		|| NewAccessToken.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Supabase token refresh response parse failed. Retrying in 60s."));
+		ScheduleTokenRefresh(60.0f);
+		return;
+	}
+
+	// 같은 유저의 토큰만 바뀌므로 AuthSessionGeneration은 올리지 않습니다.
+	// 진행 중인 상점/보상 요청이 버려지지 않게 하기 위함입니다.
+	AccessToken = MoveTemp(NewAccessToken);
+	StoreSessionTokens(JsonObject);
+	UE_LOG(LogTemp, Log, TEXT("Supabase access token refreshed."));
+}
+
 void USupabaseSubsystem::LoadLeaderboard(int32 Limit)
 {
+	if (bOfflineGuest)
+	{
+		OnLeaderboardLoaded.Broadcast(false, TEXT("오프라인 모드에서는 랭킹을 볼 수 없습니다."));
+		return;
+	}
+
 	if (AccessToken.IsEmpty())
 	{
 		OnLeaderboardLoaded.Broadcast(false, TEXT("Please log in again to view rankings."));
@@ -461,6 +852,12 @@ TSharedRef<IHttpRequest, ESPMode::ThreadSafe> USupabaseSubsystem::CreateAuthoriz
 
 void USupabaseSubsystem::LoadPlayerData()
 {
+	if (bOfflineGuest)
+	{
+		OnPlayerDataLoaded.Broadcast(true, TEXT("Offline guest session."));
+		return;
+	}
+
 	// access_token이 없으면 로그인하지 않은 상태이므로 DB 요청을 보내지 않습니다.
 	if (AccessToken.IsEmpty())
 	{
@@ -530,6 +927,19 @@ void USupabaseSubsystem::LoadCosmeticData()
 	if (IsShopOperationInFlight())
 	{
 		UE_LOG(LogTemp, Verbose, TEXT("Cosmetic data refresh was skipped during a shop operation."));
+		return;
+	}
+
+	// 오프라인 게스트는 서버 데이터 없이 기본 캐릭터로 진행합니다.
+	// 성공으로 알려야 메인 메뉴가 기본 캐릭터 프리뷰를 띄웁니다.
+	if (bOfflineGuest)
+	{
+		if (ShopSkins.Num() == 0)
+		{
+			BuildOfflineShopCatalog();
+		}
+		bHasCosmeticDataSnapshot = true;
+		OnCosmeticDataLoaded.Broadcast(true, TEXT("Offline guest: local shop."));
 		return;
 	}
 
@@ -1314,6 +1724,24 @@ void USupabaseSubsystem::EquipSkin(const FString& SkinId)
 		return;
 	}
 
+	// 오프라인 게스트는 장착 정보를 이 PC 메모리에만 저장합니다.
+	if (bOfflineGuest)
+	{
+		const TArray<FShowDownSkin>* OfflineItems = SkinSetItemsBySetId.Find(SkinId);
+		if (!OfflineItems || !IsSkinOwned(SkinId))
+		{
+			OnSkinEquipped.Broadcast(false, TEXT("Shop item is not owned."));
+			return;
+		}
+
+		for (const FShowDownSkin& Item : *OfflineItems)
+		{
+			EquippedSkinIdsByType.Add(Item.Type, Item.Id);
+		}
+		OnSkinEquipped.Broadcast(true, TEXT("Offline guest equip."));
+		return;
+	}
+
 	if (AccessToken.IsEmpty())
 	{
 		OnSkinEquipped.Broadcast(false, TEXT("Access token is empty."));
@@ -1383,6 +1811,27 @@ void USupabaseSubsystem::PurchaseSkinSet(const FString& SetId)
 	if (bCosmeticDataLoadInFlight)
 	{
 		OnSkinSetPurchased.Broadcast(false, TEXT("Cosmetic data is still loading."));
+		return;
+	}
+
+	// 오프라인 게스트는 코인이 무제한이라 서버 없이 바로 보유 처리합니다.
+	if (bOfflineGuest)
+	{
+		if (!SkinSetItemsBySetId.Contains(SetId))
+		{
+			OnSkinSetPurchased.Broadcast(false, TEXT("Shop item not found."));
+			return;
+		}
+		if (IsSkinOwned(SetId))
+		{
+			OnSkinSetPurchased.Broadcast(false, TEXT("Shop item is already owned."));
+			return;
+		}
+
+		OwnedSkinSetIds.AddUnique(SetId);
+		Coin = OfflineGuestCoin;
+		OnSkinSetPurchased.Broadcast(true, TEXT("Offline guest purchase."));
+		OnPlayerDataLoaded.Broadcast(true, TEXT("Offline guest coin refreshed."));
 		return;
 	}
 

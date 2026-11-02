@@ -945,6 +945,9 @@ private:
 	TArray<AShowDownCharacter*> GetShowDownCharacters() const;
 	void ConfigureSinglePlayerCharacters();
 	void ConfigureMultiplayerCharacters(const TArray<ASDPlayerState*>& Players);
+
+	// 싱글플레이 상대 캐릭터 스킨을 무작위로 고릅니다(플레이어/직전 판과 겹치지 않게).
+	static FString PickRandomOpponentSkinId(const FString& PlayerSkinId);
 	void RefreshMultiplayerCharacterVisibility();
 	float ResolveMultiplayerRouletteResultDelay() const;
 	float ResolveMultiplayerRoulettePresentationDelay(bool bLiveRound) const;

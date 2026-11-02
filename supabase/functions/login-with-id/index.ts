@@ -76,6 +76,12 @@ Deno.serve(async (req) => {
     const { data: signInData, error: signInError } =
       await anon.auth.signInWithPassword({ email, password });
 
+    // 로그인 횟수 제한(기본 5분당 30회)에 걸린 경우는 비밀번호 오류와 구분해서 알려줍니다.
+    // 이 함수는 모든 유저의 로그인을 서버 한 곳에서 대신하므로, 시연장처럼 로그인이 몰리면 제한에 걸릴 수 있습니다.
+    if (signInError?.status === 429) {
+      return jsonResponse({ error: "Too many login attempts." }, 429);
+    }
+
     if (signInError || !signInData?.session) {
       return jsonResponse({ error: "Invalid credentials." }, 401);
     }

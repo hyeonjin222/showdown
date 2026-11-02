@@ -91,3 +91,6 @@ Source/ShowDown/Private/SDLLMSecrets.h
 !/Binaries/ThirdParty/Whisper/**
 !/Binaries/ThirdParty/eSpeakNG/
 !/Binaries/ThirdParty/eSpeakNG/**
+
+# Local LLM API key (Gemini free tier) for demo machines
+LLMKey.txt

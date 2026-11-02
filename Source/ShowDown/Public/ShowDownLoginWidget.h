@@ -83,6 +83,17 @@ private:
 
 	void HideStatusMessage();
 	void ShowStatusError(const FString& Message);
+
+	// 로그인 화면에 항상 보이는 "오프라인으로 시작" 버튼입니다. 서버 없이 싱글플레이 시연을 시작합니다.
+	// WBP_Login 에셋을 고치지 않도록 실행 중에 상태 문구 아래에 붙입니다.
+	UPROPERTY(Transient)
+	UButton* Button_Offline = nullptr;
+
+	void EnsureOfflineButton();
+	void SetOfflineButtonVisible(bool bVisible);
+
+	UFUNCTION()
+	void HandleOfflineClicked();
 	
 	// 로그인 성공 후 띄울 메인 메뉴 WBP 클래스입니다.
 	// 에디터에서 WBP_MainMenu를 지정합니다.
